@@ -5,76 +5,110 @@
 #     "huggingface-hub",
 #     "tqdm",
 #     "requests",
-#     "python-dateutil",
 # ]
 # ///
 
 import argparse
-from huggingface_hub import HfApi, ModelFilter
-from tqdm import tqdm
-import json
-import time
 import datetime
+import json
+
+from huggingface_hub import HfApi
+from tqdm import tqdm
 import requests
-import datetime as dt
-from dateutil.parser import parse
+
 
 class ModelProcessor:
     def __init__(self, args):
         self.args = args
         self.api = HfApi()
-        self.model_filter = ModelFilter(author=args.user) if args.user else None
 
     def fetch_and_filter_models(self):
-        all_models = list(self.api.list_models(filter=self.model_filter))
-        print(f"Total models count: {len(all_models)}")
-        filtered_models = (
-            [
-                m
-                for m in all_models
-                if any(f.lower() in m.modelId.lower() for f in self.args.filter)
-                and m.author.lower() == self.args.user.lower()
-            ]
-            if self.args.filter
-            else all_models
-        )
-        if self.args.sort == "lastModified":
-            filtered_models.sort(key=lambda x: x.lastModified, reverse=True)
-        elif self.args.sort == "name":
-            filtered_models.sort(key=lambda x: x.modelId.lower())
+        kwargs = {}
+        if self.args.user:
+            kwargs["author"] = self.args.user
+        if self.args.pipeline_tag:
+            kwargs["pipeline_tag"] = self.args.pipeline_tag
+        if self.args.params:
+            kwargs["num_parameters"] = self.args.params
+        if self.args.skip_gated:
+            kwargs["gated"] = False
+
+        sort_map = {
+            "lastModified": "last_modified",
+            "downloads": "downloads",
+            "likes": "likes",
+            "trending": "trending_score",
+        }
+        if self.args.sort in sort_map:
+            kwargs["sort"] = sort_map[self.args.sort]
+
+        # Use expand to get full metadata in one shot (avoids per-model model_info calls)
+        kwargs["expand"] = ["lastModified", "trendingScore", "downloads", "likes", "author"]
+
         if self.args.limit is not None:
-            filtered_models = filtered_models[: self.args.limit]
-        print("Number of models after filtering:", len(filtered_models))
-        time.sleep(1)
-        return filtered_models
+            kwargs["limit"] = self.args.limit
+
+        if self.args.filter:
+            seen = set()
+            all_models = []
+            for term in self.args.filter:
+                for m in self.api.list_models(search=term, **kwargs):
+                    if m.id not in seen:
+                        seen.add(m.id)
+                        all_models.append(m)
+        else:
+            all_models = list(self.api.list_models(**kwargs))
+
+        print(f"Total models found: {len(all_models)}")
+
+        if self.args.verbose:
+            for m in all_models:
+                parts = [m.id]
+                if m.trending_score is not None:
+                    parts.append(f"trending={m.trending_score}")
+                if m.downloads is not None:
+                    parts.append(f"downloads={m.downloads:,}")
+                if m.likes is not None:
+                    parts.append(f"likes={m.likes}")
+                print("  " + " | ".join(parts))
+
+        print("Number of models after filtering:", len(all_models))
+        return all_models
 
     def process_models(self, filtered_models):
-        now = dt.datetime.now().date()
+        now = datetime.datetime.now(datetime.timezone.utc).date()
         repo_table = []
         for model in tqdm(filtered_models, desc="Processing models"):
             try:
-                last_modified_str = model.lastModified if isinstance(model.lastModified, str) else model.lastModified.strftime('%Y-%m-%dT%H:%M:%SZ')
-                last_modified = parse(last_modified_str).date()
-                if (now - last_modified).days > self.args.age:
-                    print(
-                        f"Removed outdated repo: {(model.modelId)} : last update: {last_modified}"
-                    )  # Added debug print info
+                last_modified = model.last_modified
+                if last_modified is None:
+                    # Fallback to per-model info if expand didn't populate it
+                    info = self.api.model_info(model.id)
+                    last_modified = info.last_modified
+                if last_modified is None:
+                    print(f"Skipping {model.id}: no last_modified date")
+                    continue
+                if isinstance(last_modified, str):
+                    last_modified = datetime.datetime.fromisoformat(last_modified)
+                last_modified_date = last_modified.date()
+                if (now - last_modified_date).days > self.args.age:
+                    print(f"Removed outdated repo: {model.id} : last update: {last_modified_date}")
                     continue
                 repo_data = {
-                    "name": model.modelId.replace("/", "#")
+                    "name": model.id.replace("/", "#")
                     .replace("_", "#")
                     .replace("-", "#"),
-                    "original_name": model.modelId,
+                    "original_name": model.id,
                     "branches": [],
+                    "last_update": last_modified.strftime('%Y-%m-%dT%H:%M:%SZ'),
                 }
-                git_refs = self.api.list_repo_refs(model.modelId, repo_type="model")
+                git_refs = self.api.list_repo_refs(model.id, repo_type="model")
                 branches = [b for b in git_refs.branches if not b.name.startswith(".git")]
-                repo_data["last_update"] = model.lastModified.strftime('%Y-%m-%dT%H:%M:%SZ')
 
                 non_empty_branch_found = False
                 for branch in branches:
                     try:
-                        files = self.api.list_repo_files(model.modelId, revision=branch.name)
+                        files = self.api.list_repo_files(model.id, revision=branch.name)
                         if files:
                             non_empty_branch_found = True
                             repo_data["branches"].append(
@@ -89,15 +123,13 @@ class ModelProcessor:
                                 }
                             )
                     except Exception as e:
-                        print(f"Error fetching files for model {model.modelId} on branch {branch.name}: {e}")
+                        print(f"Error fetching files for model {model.id} on branch {branch.name}: {e}")
                 if non_empty_branch_found:
                     repo_table.append(repo_data)
                 else:
-                    print(
-                        f"Empty repo detected and skipped: {model.modelId}"
-                    )  # Print info about empty repo
+                    print(f"Empty repo detected and skipped: {model.id}")
             except Exception as e:
-                print(f"Error fetching branches for model {model.modelId}: {e}")
+                print(f"Error fetching branches for model {model.id}: {e}")
         return repo_table
 
     def get_existing_torrents(self, url):
@@ -127,9 +159,7 @@ class ModelProcessor:
             else:
                 if self.args.rd:
                     removed_repos.append(repo)
-                    print(
-                        f"Removed duplicated repo: {repo['original_name']}"
-                    )  # Added debug print info
+                    print(f"Removed duplicated repo: {repo['original_name']}")
                 else:
                     duplicated_repos.append(repo)
         with open(self.args.filename + "-models.json", "w") as f:
@@ -153,28 +183,54 @@ class ModelProcessor:
                     indent=4,
                 )
 
+
 def parse_arguments():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--user", type=str, default=None)
-    parser.add_argument("--filter", type=str, nargs="+", default=[])
-    parser.add_argument("--age", type=int, default=30)  # in days
-    parser.add_argument(
-        "--sort", type=str, default="lastModified", choices=["lastModified", "name"]
+    parser = argparse.ArgumentParser(
+        description="Generate model lists from Hugging Face Hub for torrent creation."
     )
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--user", type=str, default=None, help="Filter by author/org (e.g. mlx-community, TheBloke)")
+    parser.add_argument("--filter", type=str, nargs="+", default=[], help="Search terms to match in model names")
+    parser.add_argument("--age", type=int, default=30, help="Max age in days (models older than this are skipped)")
     parser.add_argument(
-        "--rd",
-        "--remove-duplicates",
-        action="store_true",
-        help="Enable removing duplicate repositories",
+        "--sort", type=str, default="lastModified",
+        choices=["lastModified", "downloads", "likes", "trending", "name"],
+        help="Sort models by this field",
+    )
+    parser.add_argument("--limit", type=int, default=None, help="Max number of models to process")
+    parser.add_argument(
+        "--pipeline-tag", type=str, default=None,
+        help="Filter by pipeline/task (e.g. text-generation, image-classification)",
+    )
+    parser.add_argument(
+        "--params", type=str, default=None,
+        help="Filter by parameter count (e.g. 'min:1B,max:7B', 'max:3B')",
+    )
+    parser.add_argument(
+        "--trending", action="store_true",
+        help="Discovery mode: fetch trending models from HF (no --user or --filter needed). Combines with --pipeline-tag, --params, --limit, etc.",
+    )
+    parser.add_argument(
+        "--skip-gated", action="store_true",
+        help="Exclude gated models that require access requests",
+    )
+    parser.add_argument(
+        "--rd", "--remove-duplicates", action="store_true",
+        help="Remove models that already have torrents",
     )
     parser.add_argument("--filename", type=str, default=f"string_model_{datetime.date.today().strftime('%d%m%Y')}")
+    parser.add_argument("--verbose", action="store_true", help="Show details for each matched model")
     return parser.parse_args()
+
 
 def main():
     args = parse_arguments()
-    if not (args.user or args.filter):
-        raise ValueError("At least one of --user or --filter must be provided")
+    if args.trending:
+        # Trending is a standalone discovery mode — force sort and a default limit
+        args.sort = "trending"
+        if args.limit is None:
+            args.limit = 20
+    elif not (args.user or args.filter):
+        raise ValueError("At least one of --user, --filter, or --trending must be provided")
     processor = ModelProcessor(args)
     filtered_models = processor.fetch_and_filter_models()
     repo_table = processor.process_models(filtered_models)
@@ -182,5 +238,7 @@ def main():
         "https://api.github.com/repos/Nondzu/LlamaTor/contents/torrents?ref=torrents"
     )
     processor.filter_and_output_repos(repo_table, existing_torrents)
+
+
 if __name__ == "__main__":
     main()
