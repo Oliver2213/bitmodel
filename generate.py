@@ -2,56 +2,69 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
+#     "click",
 #     "huggingface-hub",
 #     "tqdm",
 #     "requests",
 # ]
 # ///
 
-import argparse
 import datetime
 import json
 
+import click
 from huggingface_hub import HfApi
 from tqdm import tqdm
 import requests
 
 
 class ModelProcessor:
-    def __init__(self, args):
-        self.args = args
+    def __init__(self, user, filter, age, sort, limit, pipeline_tag, params,
+                 trending, skip_gated, remove_duplicates, filename, verbose):
+        self.user = user
+        self.filter = filter
+        self.age = age
+        self.sort = sort
+        self.limit = limit
+        self.pipeline_tag = pipeline_tag
+        self.params = params
+        self.trending = trending
+        self.skip_gated = skip_gated
+        self.remove_duplicates = remove_duplicates
+        self.filename = filename
+        self.verbose = verbose
         self.api = HfApi()
 
     def fetch_and_filter_models(self):
         kwargs = {}
-        if self.args.user:
-            kwargs["author"] = self.args.user
-        if self.args.pipeline_tag:
-            kwargs["pipeline_tag"] = self.args.pipeline_tag
-        if self.args.params:
-            kwargs["num_parameters"] = self.args.params
-        if self.args.skip_gated:
+        if self.user:
+            kwargs["author"] = self.user
+        if self.pipeline_tag:
+            kwargs["pipeline_tag"] = self.pipeline_tag
+        if self.params:
+            kwargs["num_parameters"] = self.params
+        if self.skip_gated:
             kwargs["gated"] = False
 
         sort_map = {
-            "lastModified": "last_modified",
+            "last-modified": "last_modified",
             "downloads": "downloads",
             "likes": "likes",
             "trending": "trending_score",
         }
-        if self.args.sort in sort_map:
-            kwargs["sort"] = sort_map[self.args.sort]
+        if self.sort in sort_map:
+            kwargs["sort"] = sort_map[self.sort]
 
         # Use expand to get full metadata in one shot (avoids per-model model_info calls)
         kwargs["expand"] = ["lastModified", "trendingScore", "downloads", "likes", "author"]
 
-        if self.args.limit is not None:
-            kwargs["limit"] = self.args.limit
+        if self.limit is not None:
+            kwargs["limit"] = self.limit
 
-        if self.args.filter:
+        if self.filter:
             seen = set()
             all_models = []
-            for term in self.args.filter:
+            for term in self.filter:
                 for m in self.api.list_models(search=term, **kwargs):
                     if m.id not in seen:
                         seen.add(m.id)
@@ -59,9 +72,9 @@ class ModelProcessor:
         else:
             all_models = list(self.api.list_models(**kwargs))
 
-        print(f"Total models found: {len(all_models)}")
+        click.echo(f"Total models found: {len(all_models)}")
 
-        if self.args.verbose:
+        if self.verbose:
             for m in all_models:
                 parts = [m.id]
                 if m.trending_score is not None:
@@ -70,9 +83,9 @@ class ModelProcessor:
                     parts.append(f"downloads={m.downloads:,}")
                 if m.likes is not None:
                     parts.append(f"likes={m.likes}")
-                print("  " + " | ".join(parts))
+                click.echo("  " + " | ".join(parts))
 
-        print("Number of models after filtering:", len(all_models))
+        click.echo(f"Number of models after filtering: {len(all_models)}")
         return all_models
 
     def process_models(self, filtered_models):
@@ -86,13 +99,13 @@ class ModelProcessor:
                     info = self.api.model_info(model.id)
                     last_modified = info.last_modified
                 if last_modified is None:
-                    print(f"Skipping {model.id}: no last_modified date")
+                    click.echo(f"Skipping {model.id}: no last_modified date")
                     continue
                 if isinstance(last_modified, str):
                     last_modified = datetime.datetime.fromisoformat(last_modified)
                 last_modified_date = last_modified.date()
-                if (now - last_modified_date).days > self.args.age:
-                    print(f"Removed outdated repo: {model.id} : last update: {last_modified_date}")
+                if (now - last_modified_date).days > self.age:
+                    click.echo(f"Removed outdated repo: {model.id} : last update: {last_modified_date}")
                     continue
                 repo_data = {
                     "name": model.id.replace("/", "#")
@@ -123,13 +136,13 @@ class ModelProcessor:
                                 }
                             )
                     except Exception as e:
-                        print(f"Error fetching files for model {model.id} on branch {branch.name}: {e}")
+                        click.echo(f"Error fetching files for model {model.id} on branch {branch.name}: {e}")
                 if non_empty_branch_found:
                     repo_table.append(repo_data)
                 else:
-                    print(f"Empty repo detected and skipped: {model.id}")
+                    click.echo(f"Empty repo detected and skipped: {model.id}")
             except Exception as e:
-                print(f"Error fetching branches for model {model.id}: {e}")
+                click.echo(f"Error fetching branches for model {model.id}: {e}")
         return repo_table
 
     def get_existing_torrents(self, url):
@@ -157,19 +170,19 @@ class ModelProcessor:
             if repo["name"] not in existing_torrents:
                 output_repos.append(repo)
             else:
-                if self.args.rd:
+                if self.remove_duplicates:
                     removed_repos.append(repo)
-                    print(f"Removed duplicated repo: {repo['original_name']}")
+                    click.echo(f"Removed duplicated repo: {repo['original_name']}")
                 else:
                     duplicated_repos.append(repo)
-        with open(self.args.filename + "-models.json", "w") as f:
+        with open(self.filename + "-models.json", "w") as f:
             json.dump(
                 [{**repo, "name": repo["original_name"]} for repo in output_repos],
                 f,
                 indent=4,
             )
         if removed_repos:
-            with open(self.args.filename + "removed_repos-models.json", "w") as f:
+            with open(self.filename + "removed_repos-models.json", "w") as f:
                 json.dump(
                     {
                         "removed_repos": [
@@ -184,54 +197,38 @@ class ModelProcessor:
                 )
 
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(
-        description="Generate model lists from Hugging Face Hub for torrent creation."
-    )
-    parser.add_argument("--user", type=str, default=None, help="Filter by author/org (e.g. mlx-community, TheBloke)")
-    parser.add_argument("--filter", type=str, nargs="+", default=[], help="Search terms to match in model names")
-    parser.add_argument("--age", type=int, default=30, help="Max age in days (models older than this are skipped)")
-    parser.add_argument(
-        "--sort", type=str, default="lastModified",
-        choices=["lastModified", "downloads", "likes", "trending", "name"],
-        help="Sort models by this field",
-    )
-    parser.add_argument("--limit", type=int, default=None, help="Max number of models to process")
-    parser.add_argument(
-        "--pipeline-tag", type=str, default=None,
-        help="Filter by pipeline/task (e.g. text-generation, image-classification)",
-    )
-    parser.add_argument(
-        "--params", type=str, default=None,
-        help="Filter by parameter count (e.g. 'min:1B,max:7B', 'max:3B')",
-    )
-    parser.add_argument(
-        "--trending", action="store_true",
-        help="Discovery mode: fetch trending models from HF (no --user or --filter needed). Combines with --pipeline-tag, --params, --limit, etc.",
-    )
-    parser.add_argument(
-        "--skip-gated", action="store_true",
-        help="Exclude gated models that require access requests",
-    )
-    parser.add_argument(
-        "--rd", "--remove-duplicates", action="store_true",
-        help="Remove models that already have torrents",
-    )
-    parser.add_argument("--filename", type=str, default=f"string_model_{datetime.date.today().strftime('%d%m%Y')}")
-    parser.add_argument("--verbose", action="store_true", help="Show details for each matched model")
-    return parser.parse_args()
+@click.command()
+@click.option("--user", default=None, help="Filter by author/org (e.g. mlx-community, TheBloke).")
+@click.option("--filter", multiple=True, help="Search terms to match in model names. Can be repeated.")
+@click.option("--age", default=30, show_default=True, help="Max age in days (models older than this are skipped).")
+@click.option("--sort", default="last-modified",
+              type=click.Choice(["last-modified", "downloads", "likes", "trending", "name"], case_sensitive=False),
+              show_default=True, help="Sort models by this field.")
+@click.option("--limit", default=None, type=int, help="Max number of models to process.")
+@click.option("--pipeline-tag", default=None, help="Filter by pipeline/task (e.g. text-generation).")
+@click.option("--params", default=None, help="Filter by parameter count (e.g. 'min:1B,max:7B', 'max:3B').")
+@click.option("--trending", is_flag=True, help="Discovery mode: fetch trending models (no --user/--filter needed).")
+@click.option("--skip-gated", is_flag=True, help="Exclude gated models that require access requests.")
+@click.option("--remove-duplicates", is_flag=True, help="Remove models that already have torrents.")
+@click.option("--filename", default=f"string_model_{datetime.date.today().strftime('%d%m%Y')}",
+              show_default=True, help="Output filename prefix.")
+@click.option("--verbose", is_flag=True, help="Show details for each matched model.")
+def main(user, filter, age, sort, limit, pipeline_tag, params, trending,
+         skip_gated, remove_duplicates, filename, verbose):
+    """Generate model lists from Hugging Face Hub for torrent creation."""
+    if trending:
+        sort = "trending"
+        if limit is None:
+            limit = 20
+    elif not (user or filter):
+        raise click.UsageError("At least one of --user, --filter, or --trending must be provided.")
 
-
-def main():
-    args = parse_arguments()
-    if args.trending:
-        # Trending is a standalone discovery mode — force sort and a default limit
-        args.sort = "trending"
-        if args.limit is None:
-            args.limit = 20
-    elif not (args.user or args.filter):
-        raise ValueError("At least one of --user, --filter, or --trending must be provided")
-    processor = ModelProcessor(args)
+    processor = ModelProcessor(
+        user=user, filter=filter, age=age, sort=sort, limit=limit,
+        pipeline_tag=pipeline_tag, params=params, trending=trending,
+        skip_gated=skip_gated, remove_duplicates=remove_duplicates,
+        filename=filename, verbose=verbose,
+    )
     filtered_models = processor.fetch_and_filter_models()
     repo_table = processor.process_models(filtered_models)
     existing_torrents = processor.get_existing_torrents(
