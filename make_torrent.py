@@ -9,6 +9,7 @@
 
 import fnmatch
 import hashlib
+import json
 import os
 import time
 import urllib.parse
@@ -45,6 +46,24 @@ TRACKERS = [
 ]
 
 
+def load_model_comments(models_file):
+    """Build a map of folder name -> torrent comment from a models JSON file."""
+    comments = {}
+    with open(models_file) as f:
+        models = json.load(f)
+    for model in models:
+        model_name = model["name"]
+        dir_name = model_name.replace("/", "_")
+        parts = []
+        for branch in model.get("branches", []):
+            commit = branch.get("commit")
+            if commit:
+                parts.append(f"{model_name}@{branch['name']} {commit[:12]}")
+        if parts:
+            comments[dir_name] = "; ".join(parts)
+    return comments
+
+
 def make_magnet(torrent_path, tracker_count):
     meta = pyben.load(torrent_path)
     info = meta["info"]
@@ -65,17 +84,19 @@ def make_magnet(torrent_path, tracker_count):
               help="The folder containing the downloaded models.")
 @click.option("-o", "--output-directory", required=True, type=click.Path(),
               help="The folder where generated torrent files will be saved.")
+@click.option("--models-file", default=None, type=click.Path(exists=True),
+              help="Models JSON file (from generate.py) to embed source commit info in torrent metadata.")
 @click.option("--filter", "filter_pattern", default="*", show_default=True,
               help="Glob pattern for folder names (e.g. '*AWQ*').")
 @click.option("--piece-size", default=DEFAULT_PIECE_SIZE, show_default=True, type=int,
               help="Piece size in bytes.")
 @click.option("--print-magnets", is_flag=True, help="Print magnet links to stdout.")
 @click.option("--magnets-file", default=None, type=click.Path(),
-              help="Write magnet links to this file.")
+              help="Append magnet links to this file.")
 @click.option("--magnet-tracker-count", default="5", show_default=True,
               help="Number of trackers to include in magnet links, or 'all'.")
-def main(input_directory, output_directory, filter_pattern, piece_size,
-         print_magnets, magnets_file, magnet_tracker_count):
+def main(input_directory, output_directory, models_file, filter_pattern,
+         piece_size, print_magnets, magnets_file, magnet_tracker_count):
     """Generate hybrid v1+v2 torrent files for AI models."""
     os.makedirs(output_directory, exist_ok=True)
 
@@ -83,6 +104,10 @@ def main(input_directory, output_directory, filter_pattern, piece_size,
         tracker_count = len(TRACKERS)
     else:
         tracker_count = min(int(magnet_tracker_count), len(TRACKERS))
+
+    model_comments = {}
+    if models_file:
+        model_comments = load_model_comments(models_file)
 
     folders = sorted(
         f for f in os.listdir(input_directory)
@@ -105,12 +130,17 @@ def main(input_directory, output_directory, filter_pattern, piece_size,
         click.echo(f"[{i}/{len(folders)}] {folder}")
         folder_start = time.time()
 
-        t = TorrentFileHybrid(
+        kwargs = dict(
             path=content_path,
             announce=TRACKERS,
             piece_length=piece_size,
             progress=0,
         )
+        comment = model_comments.get(folder)
+        if comment:
+            kwargs["comment"] = comment
+
+        t = TorrentFileHybrid(**kwargs)
         t.write(output_file)
 
         if print_magnets or magnets_file:

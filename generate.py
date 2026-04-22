@@ -127,6 +127,7 @@ class ModelProcessor:
                             repo_data["branches"].append(
                                 {
                                     "name": branch.name,
+                                    "commit": branch.target_commit,
                                     "files": [
                                         f
                                         for f in files
